@@ -100,7 +100,8 @@ rpc_call() {
   log 'CLI 상태 조회 시간 초과. 질문을 보내지 않습니다.' >&2; return 1
 }
 read_limits() {
-  local response ok=0
+  local response ok=0 requested_at
+  requested_at=$(date +%s)
   RPC_DIR=$(mktemp -d "${TMPDIR:-/tmp}/codex-window.XXXXXX")
   mkfifo "$RPC_DIR/in"
   exec 3<>"$RPC_DIR/in"
@@ -113,7 +114,39 @@ read_limits() {
     fi
   fi
   stop_rpc
+  if (( ok == 1 )); then
+    log "사용량 진단: $(limits_diagnostic "$requested_at" "$(date +%s)")"
+  else
+    log "사용량 조회 실패 / 요청시각=$requested_at / 종료시각=$(date +%s)"
+  fi
   (( ok == 1 ))
+}
+
+limits_diagnostic() {
+  local account_tag='unknown'
+  # A comparison tag helps detect account switches without logging the account ID.
+  if jq -e '.accountId | type == "string" and length > 0' <<< "$LIMITS" >/dev/null; then
+    account_tag=$(jq -jr '.accountId' <<< "$LIMITS" | cksum | awk '{print $1}')
+  fi
+  jq -c --arg id "$LIMIT_ID" --arg model "${MODEL:-default}" --arg account "$account_tag" \
+    --argjson requested "$1" --argjson received "$2" '
+    def window:
+      if . == null then null else
+        {usedPercent, windowDurationMins, resetsAt,
+         secondsUntilReset:(if (.resetsAt|type) == "number" then .resetsAt - $received else null end)}
+      end;
+    def bucket:
+      if . == null then null else
+        {limitId, planType, primary:(.primary|window), secondary:(.secondary|window),
+         spendControlReached, rateLimitReachedType}
+      end;
+    {requestedAt:$requested, receivedAt:$received, querySeconds:($received - $requested),
+     accountTag:$account, selectedLimitId:$id, pingModel:$model,
+     source:(if .rateLimitsByLimitId != null then "rateLimitsByLimitId" else "rateLimits" end),
+     ordinaryUsageAllowed,
+     rateLimits:(.rateLimits|bucket),
+     rateLimitsByLimitId:(if .rateLimitsByLimitId == null then null
+                         else .rateLimitsByLimitId | with_entries(.value |= bucket) end)}' <<< "$LIMITS"
 }
 
 # Missing fields are unknown, never evidence of an inactive window.
@@ -131,6 +164,21 @@ classify() {
     elif ($windows[0].resetsAt | type) != "number" or $windows[0].resetsAt <= 0 then "unknown"
     elif $windows[0].resetsAt > $now then "active"
     else "inactive" end' <<< "$LIMITS"
+}
+window_details() {
+  local fields used reset reset_local='unknown'
+  fields=$(jq -r --arg id "$LIMIT_ID" '
+    (if .rateLimitsByLimitId != null then .rateLimitsByLimitId[$id]
+     elif (.rateLimits.limitId == $id or (.rateLimits.limitId == null and $id == "codex")) then .rateLimits
+     else null end) as $b |
+    [$b.primary, $b.secondary] | map(select(.windowDurationMins == 300)) |
+    (if length == 1 then .[0] else {} end) |
+    [(.usedPercent // "unknown"), (.resetsAt // "unknown")] | @tsv' <<< "$LIMITS")
+  IFS=$'\t' read -r used reset <<< "$fields"
+  if [[ $reset =~ ^[0-9]+$ ]]; then
+    reset_local=$(epoch_fmt "$reset" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null) || reset_local='unknown'
+  fi
+  printf 'usedPercent=%s / resetsAt=%s / 초기화=%s' "$used" "$reset" "$reset_local"
 }
 show_limits() {
   jq --arg id "$LIMIT_ID" '
@@ -153,9 +201,12 @@ send_ping() {
   current_key=$(slot_key "$now" "$slot")
   [[ $key == "$current_key" ]] || return 0
   mkdir -p "$DATA/attempts/$account"
-  mkdir "$attempt" 2>/dev/null || return 0
+  if ! mkdir "$attempt" 2>/dev/null; then
+    log "예약 $key / 전송 생략: 기존 시도 기록이 있습니다."
+    return 0
+  fi
   printf 'attempted %s\n' "$now" >"$attempt/result"
-  log "예약 $key: 비활성 창 확인. CLI 질문을 1회 전송합니다."
+  log "예약 $key: 비활성 창 확인. CLI 질문을 1회 전송합니다. / model=${MODEL:-default} / attemptedAt=$now"
   local args=(exec --ignore-user-config --ignore-rules --ephemeral --skip-git-repo-check
     --sandbox read-only -c 'approval_policy="never"' -c 'project_doc_max_bytes=0'
     --color never --json -C "$attempt")
@@ -179,10 +230,11 @@ send_ping() {
     return 0
   fi
   printf 'sent\n' >"$attempt/result"
+  log "예약 $key / CLI 응답 완료 / 소요시간=$(( $(date +%s) - started ))초"
   if read_limits; then
     state=$(classify "$(date +%s)")
     printf 'sent observed=%s\n' "$state" >"$attempt/result"
-    log "전송 후 창 상태: $state (active일 때 활성 전환 확인)."
+    log "전송 후 창 상태: $state / $(window_details)"
   else
     log '질문은 완료됐지만 활성 전환을 확인하지 못했습니다. 재전송하지 않습니다.'
   fi
@@ -197,7 +249,7 @@ tick() {
   key=$(slot_key "$epoch" "$slot")
   if ! read_limits; then log '상태 조회 실패. 전송하지 않습니다.'; return 0; fi
   state=$(classify "$(date +%s)")
-  log "예약 $key / 창 상태: $state"
+  log "예약 $key / 창 상태: $state / $(window_details)"
   [[ $state == inactive ]] || return 0
   account=$(jq -r '.accountId // empty' <<< "$LIMITS")
   [[ $account =~ ^[a-zA-Z0-9_-]+$ ]] || { log '계정 ID를 확인하지 못해 전송하지 않습니다.'; return 0; }
@@ -205,6 +257,7 @@ tick() {
   send_ping "$key" "$account"
 }
 main() {
+  local previous_slot='' current_slot=''
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -213,14 +266,23 @@ main() {
     status)
       log "예약: $START_TIMES / 휴식: $QUIET_START~$QUIET_END"
       read_limits || die '사용량을 조회할 수 없습니다. codex login 상태를 확인하세요.'
-      log "5시간 창: $(classify "$(date +%s)")"
+      log "5시간 창: $(classify "$(date +%s)") / $(window_details)"
       show_limits ;;
     dry-run) tick dry ;;
     once) acquire_lock; tick live ;;
     run)
       acquire_lock
-      log "감시 시작: $START_TIMES / 휴식 $QUIET_START~$QUIET_END"
-      while true; do load_config; tick live; sleep "$CHECK_INTERVAL_SECONDS"; done ;;
+      log "감시 시작: $START_TIMES / 휴식 $QUIET_START~$QUIET_END / 유예=${START_GRACE_MINUTES}분 / 확인주기=${CHECK_INTERVAL_SECONDS}초 / model=${MODEL:-default} / CLI=$("$CODEX_BIN" --version)"
+      while true; do
+        load_config
+        current_slot=$(slot_for "$(date '+%H:%M')" || true)
+        if [[ -n $previous_slot && $previous_slot != "$current_slot" ]]; then
+          log "예약 $previous_slot / 확인 종료: 시작 유예 시간 또는 허용 시간대가 끝났습니다."
+        fi
+        previous_slot=$current_slot
+        tick live
+        sleep "$CHECK_INTERVAL_SECONDS"
+      done ;;
     *) die '사용법: scheduler.sh {status|dry-run|once|run}' ;;
   esac
 }
