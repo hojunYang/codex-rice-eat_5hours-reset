@@ -23,15 +23,6 @@ expect "$(slot_for 00:02)" 23:58
 epoch=$(to_epoch '2026-10-20 00:02:00')
 expect "$(slot_key "$epoch" 23:58)" 2026-10-19_23-58
 load_config
-LIMITS='{"rateLimitsByLimitId":{"codex":{"primary":{"windowDurationMins":300,"usedPercent":0,"resetsAt":2000}}}}'
-expect "$(classify 1000)" active
-expect "$(classify 2000)" inactive
-LIMITS='{"rateLimits":{"limitId":"codex","primary":{"windowDurationMins":300,"resetsAt":null}}}'
-expect "$(classify 2000)" unknown
-LIMITS='{"rateLimits":{"limitId":"codex","primary":{"windowDurationMins":300,"resetsAt":1000},"secondary":{"windowDurationMins":10080,"usedPercent":100,"resetsAt":3000}}}'
-expect "$(classify 2000)" blocked
-LIMITS='{"rateLimits":{"limitId":"codex","primary":{"windowDurationMins":300,"resetsAt":1000}},"rateLimitsByLimitId":{"other":{}}}'
-expect "$(classify 2000)" unknown
 
 # Stub the CLI and clock: no real model requests, including failure/retry cases.
 TEST_DIR=$(mktemp -d)
@@ -53,9 +44,6 @@ date() {
     *) /bin/date "$@" ;;
   esac
 }
-read_limits() {
-  LIMITS='{"accountId":"test-account","rateLimits":{"limitId":"codex","primary":{"windowDurationMins":300,"resetsAt":1000}}}'
-}
 tick live >/dev/null
 tick live >/dev/null
 expect "$(wc -l <"$CALL_LOG" | tr -d ' ')" 1
@@ -64,4 +52,4 @@ DATA="$TEST_DIR/failure"; mkdir -p "$DATA"
 tick live >/dev/null
 tick live >/dev/null
 expect "$(wc -l <"$CALL_LOG" | tr -d ' ')" 2
-echo 'PASS: 시간 경계, 자정, 잔여량 100%의 활성 창, 누락 상태, 주간 한도, 성공/실패 후 중복 방지'
+echo 'PASS: 시간 경계, 자정, 슬롯당 1회 전송, 성공/실패 후 중복 방지'

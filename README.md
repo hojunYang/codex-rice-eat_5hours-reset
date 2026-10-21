@@ -7,13 +7,12 @@
 
 ## 기술 요약
 
-Linux와 macOS에서 Bash + jq로 동작하며, ChatGPT로 로그인한 Codex CLI가 필요합니다.
+Linux와 macOS에서 Bash로 동작하며 (macOS 서비스 등록에는 jq 필요), ChatGPT로 로그인한 Codex CLI가 필요합니다.
 
 ### 사용법
 
 ```sh
-./scheduler.sh status    # 계정 상태 조회 (질문 없음)
-./scheduler.sh dry-run   # 현재 예약 조건 확인 (질문 없음)
+./scheduler.sh dry-run   # 지금 전송 대상인지 확인 (질문 없음)
 ./scheduler.sh run       # 계속 감시 (Ctrl+C로 중단)
 
 ./service.sh install     # Linux: systemd 사용자 서비스 / macOS: LaunchAgent
@@ -36,19 +35,13 @@ Linux에서 로그아웃 후에도 유지하려면 `sudo loginctl enable-linger 
 
 ### 동작 방식
 
-1. `codex app-server`의 `account/rateLimits/read`에서 `LIMIT_ID` 버킷의 `windowDurationMins == 300` 창을 찾습니다.
-2. 아래 기준으로 판정합니다.
-   - `resetsAt > 현재`: 활성. 잔여량이 100%여도 대기합니다.
-   - 유효한 `resetsAt <= 현재`: 비활성으로 추정하고 예약 시간에 1회 전송합니다.
-   - 창이나 시각이 없거나 조회에 실패: 불명. 전송을 보류합니다.
-   - 주간 한도 등 다른 창이 소진됐거나 서버가 사용을 막음: 전송을 보류합니다.
-3. 활성 여부를 나타내는 boolean이 API에 없어서, 서버가 준 초기화 시각으로 추정합니다. 이미 활성인 창을 강제로 초기화하지는 않습니다.
+창 상태(활성/비활성)는 보지 않습니다. 서버가 창이 시작되지 않았을 때도 `resetsAt`을 `지금 + 5시간`으로 내려줘서 활성 여부를 신뢰할 수 없기 때문입니다.
+예약 시각이 되면 `START_GRACE_MINUTES` 안에서 질문을 예약당 1회 전송합니다. 휴식 시간에는 전송하지 않습니다.
 
 ### 중복 방지
 
-- 전송 직전에 `.state/attempts/<계정>/<예약>`에 기록을 남깁니다. 실패나 시간 초과여도 같은 예약은 재전송하지 않습니다.
-- 전송 후 사용량을 다시 조회해 결과를 기록합니다. `sent observed=active`면 활성 전환을 확인한 것입니다.
+- 전송 직전에 `.state/attempts/<예약>`에 기록을 남깁니다. 실패나 시간 초과여도 같은 예약은 재전송하지 않습니다.
 - 동시 실행은 `.state/lock`으로 막습니다. 강제 종료 후 잠금이 남았다면 `lock/pid`의 프로세스가 종료됐는지 확인한 뒤 잠금 디렉터리만 지우세요. `.state/attempts`를 지우면 중복 방지 기록도 사라집니다.
-- 조회만으로는 모델을 호출하지 않고, 무료 초기화 크레딧도 쓰지 않습니다.
+- `dry-run`은 모델을 호출하지 않습니다.
 
 공식 프로토콜: https://learn.chatgpt.com/docs/app-server

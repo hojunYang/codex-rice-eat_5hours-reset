@@ -6,7 +6,6 @@ ROOT=$(cd "$(dirname "$0")" && pwd)
 NAME=codex-rice-eat
 
 need_tools() {
-  command -v jq >/dev/null || { echo "먼저 jq를 설치하세요 ($1)."; exit 1; }
   command -v codex >/dev/null || { echo 'PATH에서 codex를 찾을 수 없습니다.'; exit 1; }
 }
 
@@ -15,7 +14,7 @@ linux_service() {
   local unit="$unit_dir/$NAME.service"
   case $1 in
     install)
-      need_tools 'sudo apt install jq'
+      need_tools
       [[ $ROOT != *%* && $PATH != *%* ]] || { echo '경로에 % 문자를 쓸 수 없습니다.'; exit 1; }
       [[ ! -e $unit ]] || { echo "이미 설치되어 있습니다: $unit"; exit 1; }
       mkdir -p "$unit_dir" "$ROOT/.state"
@@ -57,7 +56,8 @@ mac_service() {
   local domain="gui/$(id -u)"
   case $1 in
     install)
-      need_tools 'brew install jq'
+      need_tools
+      command -v jq >/dev/null || { echo '먼저 jq를 설치하세요 (brew install jq).'; exit 1; }
       mkdir -p "$HOME/Library/LaunchAgents" "$ROOT/.state"
       [[ ! -e $plist ]] || { echo "이미 설치되어 있습니다: $plist"; exit 1; }
       plutil -create xml1 "$plist"
