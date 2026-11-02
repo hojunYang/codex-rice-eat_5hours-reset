@@ -52,4 +52,21 @@ DATA="$TEST_DIR/failure"; mkdir -p "$DATA"
 tick live >/dev/null
 tick live >/dev/null
 expect "$(wc -l <"$CALL_LOG" | tr -d ' ')" 2
-echo 'PASS: 시간 경계, 자정, 슬롯당 1회 전송, 성공/실패 후 중복 방지'
+
+# Locks: a dead owner's lock is recovered; a live scheduler's lock is respected.
+unset -f date
+DATA="$TEST_DIR/locks"
+mkdir -p "$DATA/lock"; echo 999999 >"$DATA/lock/pid"
+acquire_lock >/dev/null
+expect "$(cat "$DATA/lock/pid")" "$$"
+LOCKED=0; rm -rf "$DATA/lock"
+mkdir -p "$DATA/lock"                       # no pid file at all
+acquire_lock >/dev/null
+LOCKED=0; rm -rf "$DATA/lock"
+mkdir -p "$TEST_DIR/live"; printf '#!/bin/bash\nsleep 30\n' >"$TEST_DIR/live/scheduler.sh"
+bash "$TEST_DIR/live/scheduler.sh" & LIVE_PID=$!
+mkdir -p "$DATA/lock"; echo "$LIVE_PID" >"$DATA/lock/pid"
+if (acquire_lock >/dev/null 2>&1); then kill "$LIVE_PID"; echo 'FAIL: live lock was stolen'; exit 1; fi
+kill "$LIVE_PID"; wait "$LIVE_PID" 2>/dev/null || true
+expect "$(cat "$DATA/lock/pid")" "$LIVE_PID"
+echo 'PASS: 시간 경계, 자정, 슬롯당 1회 전송, 성공/실패 후 중복 방지, 낡은 잠금 복구'

@@ -70,10 +70,25 @@ cleanup() {
   if [[ -n $PING_PID ]]; then kill "$PING_PID" 2>/dev/null || true; fi
   if (( LOCKED )); then rm -f "$DATA/lock/pid"; rmdir "$DATA/lock" 2>/dev/null || true; fi
 }
+# A lock is stale when its owner is gone (reboot, power loss, SIGKILL). PIDs are reused
+# after a reboot, so the live process must also look like this scheduler.
+lock_is_stale() {
+  local pid
+  pid=$(cat "$DATA/lock/pid" 2>/dev/null || true)
+  # The owner writes the pid right after mkdir; give a concurrent starter a moment.
+  if [[ ! $pid =~ ^[0-9]+$ ]]; then sleep 1; pid=$(cat "$DATA/lock/pid" 2>/dev/null || true); fi
+  [[ $pid =~ ^[0-9]+$ ]] || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+  [[ $(ps -p "$pid" -o args= 2>/dev/null || true) == *scheduler.sh* ]] || return 0
+  return 1
+}
 acquire_lock() {
   mkdir -p "$DATA/attempts"
   if ! mkdir "$DATA/lock" 2>/dev/null; then
-    die "다른 실행이 있거나 이전 잠금이 남아 있습니다: $DATA/lock (PID 파일을 확인하세요.)"
+    lock_is_stale || die "다른 실행이 이미 동작 중입니다: $DATA/lock (PID $(cat "$DATA/lock/pid" 2>/dev/null || echo '?'))"
+    log "이전 실행이 남긴 잠금을 제거합니다: $DATA/lock"
+    rm -rf "$DATA/lock"
+    mkdir "$DATA/lock" 2>/dev/null || die "잠금을 다시 만들지 못했습니다: $DATA/lock"
   fi
   LOCKED=1
   printf '%s\n' "$$" >"$DATA/lock/pid"
